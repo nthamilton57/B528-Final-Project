@@ -1,0 +1,1311 @@
+---
+title: "Disease Comparison"
+author: "Noah Hamilton"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Comparison of Cytokine Storm Response Across Diseases
+This analysis compares the differential gene expression profiles associated with cytokine storms across multiple diseases:
+- COVID-19 (SARS-CoV-2)
+- Influenza (H1N1)
+- Sepsis
+- ARDS (Acute Respiratory Distress Syndrome)
+- Original SARS-CoV (2003)
+
+## Load Required Libraries
+```{r load-libraries}
+# Install required packages if not already installed
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+required_packages <- c("GEOquery", "limma", "affy", "sva", "ggplot2", 
+                      "pheatmap", "RColorBrewer", "dplyr", "AnnotationDbi", 
+                      "org.Hs.eg.db", "enrichR", "ComplexHeatmap", "circlize", "hugene10sttranscriptcluster.db", "biomaRt", "hgu133plus2.db")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE))
+    BiocManager::install(pkg)
+}
+
+# Load libraries
+library(GEOquery)
+library(limma)
+library(affy)
+library(sva)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(dplyr)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(enrichR)
+library(ComplexHeatmap)
+library(circlize)
+library(biomaRt)
+library(dplyr)
+library(hgu133plus2.db)
+library(VennDiagram)
+library(UpSetR)
+library(clusterProfiler)
+library(STRINGdb)
+```
+
+## Helper Functions
+```{r helper-functions}
+# Function to normalize expression data
+normalize_expression_data <- function(expr_data) {
+  # Simple quantile normalization as an example
+  return(normalizeQuantiles(expr_data))
+}
+
+# Function to handle multiple probes mapping to the same gene (take the one with highest variance)
+process_multiple_probes <- function(expression_df) {
+  # Calculate variance for each probe
+  probe_variance <- apply(expression_df[, !(colnames(expression_df) %in% c("probe_id", "gene_symbol"))], 1, var)
+  
+  expression_df$variance <- probe_variance
+  
+  # Remove any rows with empty gene symbols
+  expression_df <- expression_df[!is.na(expression_df$gene_symbol) & expression_df$gene_symbol != "", ]
+  
+  # Order by gene symbol and variance (descending)
+  expression_df <- expression_df[order(expression_df$gene_symbol, -expression_df$variance), ]
+  
+  # Keep only the probe with highest variance for each gene
+  unique_genes <- unique(expression_df$gene_symbol)
+  unique_genes <- unique_genes[!is.na(unique_genes)]  # Remove NA values
+  
+  # Initialize a list to store the rows to keep
+  rows_to_keep <- integer(0)
+  
+  for (gene in unique_genes) {
+    gene_rows <- which(expression_df$gene_symbol == gene)
+    rows_to_keep <- c(rows_to_keep, gene_rows[1])  # Keep the first row (highest variance)
+  }
+  
+  # Subset the data frame
+  filtered_df <- expression_df[rows_to_keep, ]
+  filtered_df$variance <- NULL  # Remove the variance column
+  
+  # Remove probe_ids column
+  filtered_df$probe_id <- NULL
+  # Switch row names to gene symbol and remove gene_symbol column
+  row.names(filtered_df) <- filtered_df$gene_symbol
+  filtered_df$gene_symbol <- NULL
+  
+  return(filtered_df)
+}
+
+# Function to create volcano plot
+create_volcano_plot <- function(results, title) {
+  # Create the plot
+  ggplot(results, aes(x = logFC, y = neg_log10_pval)) +
+    # Add points
+    geom_point(aes(color = diffexpressed), alpha = 0.8, size = 2) +
+    # Set color scheme
+    scale_color_manual(values = c("DOWN" = "royalblue", "NS" = "grey30", "UP" = "red3")) +
+    # Add horizontal line at p-value cutoff
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey50") +
+    # Add vertical lines at fold change cutoffs
+    geom_vline(xintercept = c(-1.5, 1.5), linetype = "dashed", color = "grey50") +
+    # Add theme with gridlines
+    theme_bw() +
+    theme(
+      panel.grid.major = element_line(color = "grey80", linewidth = 0.2),
+      panel.grid.minor = element_line(color = "grey90", linewidth = 0.1),
+      legend.position = "right",
+      legend.title = element_blank(),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10),
+      plot.title = element_text(size = 14, hjust = 0.5)
+    ) +
+    # Set axis labels
+    xlab("Log2 Fold Change") +
+    ylab("-log10(adjusted p-value)") +
+    ggtitle(title)
+}
+```
+
+# COVID-19
+## Download and Process
+```{r}
+gse164805 <- getGEO("GSE164805", destdir = tempdir(), GSEMatrix = TRUE, AnnotGPL = TRUE)
+expr_164805 <- exprs(gse164805[[1]])
+expr_164805 <- normalize_expression_data(expr_164805)
+
+#view the normalized data
+#boxplot(expr_164805,outline=FALSE)
+```
+
+## Get Probe Annotations for Later
+```{r}
+# Get probe annotations to have them available for interpretation later
+gpl <- getGEO("GPL26963")
+platform_info <- Table(gpl)
+probe_annotations <- platform_info[, c("ID", "ORF")]
+rownames(probe_annotations) <- probe_annotations$ID
+```
+
+## Extract Group Information
+```{r}
+# Extract sample information
+pdata_164805 <- pData(gse164805[[1]])
+
+# Create sample groups for Severe COVID vs Mild COVID vs Control comparison
+sample_groups_164805 <- ifelse(grepl("severe", pdata_164805$title, ignore.case = TRUE), "Severe_COVID", 
+                              ifelse(grepl("mild", pdata_164805$title, ignore.case = TRUE), "Mild_COVID", "Control"))
+```
+
+## Severe COVID vs Control
+```{r}
+# Filter to include only Severe COVID and Control samples
+groups_severe <- ifelse(sample_groups_164805 %in% c("Severe_COVID", "Control"), 
+                ifelse(sample_groups_164805 == "Severe_COVID", "Severe_COVID", "Control"), NA)
+
+# Filter expression data to only include Severe COVID and Control samples
+expr_164805_severe <- expr_164805[, !is.na(groups_severe)]
+
+# Create filtered groups_severe vector
+groups_severe_filtered <- groups_severe[!is.na(groups_severe)]
+
+# Set up design matrix for limma
+groups_severe_factor <- factor(groups_severe_filtered)
+design <- model.matrix(~0+groups_severe_factor)
+colnames(design) <- levels(groups_severe_factor)
+
+# Create contrast matrix
+contrast.matrix <- makeContrasts(Severe_COVID-Control, levels=design)
+
+# Fit the linear model
+fit <- lmFit(expr_164805_severe, design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# Get differentially expressed probes using the paper's criteria:
+# FDR ≤ 0.05 and |fold change| ≥ 2 (which is |log2FC| ≥ 1)
+results_severe <- topTable(fit2, number=Inf, adjust.method="BH")
+
+# Filter DEGs based on paper's thresholds
+DEGs_severe <- results_severe[results_severe$adj.P.Val <= 0.05 & abs(results_severe$logFC) >= 1.5, ]
+```
+
+### Convert Probe ID to Genes
+```{r}
+# Add gene annotation to results for interpretation
+DEGs_severe$probe_id <- rownames(DEGs_severe)
+DEGs_severe$gene_id <- probe_annotations[rownames(DEGs_severe), "ORF"]
+
+# Set up connection to Ensembl
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Get a list of all your gene identifiers
+gene_list_severe <- DEGs_severe$gene_id
+
+# Query to get gene biotypes
+gene_info <- getBM(
+  attributes = c("external_gene_name", "ensembl_gene_id", "entrezgene_id", "gene_biotype"),
+  filters = "external_gene_name",
+  values = gene_list_severe,
+  mart = ensembl
+)
+
+# Filter to keep only protein-coding genes
+coding_genes <- gene_info[gene_info$gene_biotype == "protein_coding", ]
+
+# Get the list of coding gene identifiers
+coding_gene_ids <- coding_genes$external_gene_name
+
+# Filter your DEGs to keep only coding genes
+DEGs_coding_severe <- DEGs_severe[DEGs_severe$gene_id %in% coding_gene_ids, ]
+```
+
+
+## Mild COVID vs Control
+```{r}
+# Filter to include only MILD COVID and Control samples
+groups <- ifelse(sample_groups_164805 %in% c("Mild_COVID", "Control"), 
+                ifelse(sample_groups_164805 == "Mild_COVID", "MILD_COVID", "Control"), NA)
+
+# Filter expression data to only include Severe COVID and Control samples
+expr_164805_filtered <- expr_164805[, !is.na(groups)]
+
+# Create filtered groups vector
+groups_filtered <- groups[!is.na(groups)]
+
+# Set up design matrix for limma
+groups_factor <- factor(groups_filtered)
+design <- model.matrix(~0+groups_factor)
+colnames(design) <- levels(groups_factor)
+
+# Create contrast matrix
+contrast.matrix <- makeContrasts(MILD_COVID-Control, levels=design)
+#contrast.matrix <- makeContrasts(Control-MILD_COVID, levels=design)
+
+# Fit the linear model
+fit <- lmFit(expr_164805_filtered, design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# Get differentially expressed probes using the paper's criteria:
+# FDR ≤ 0.05 and |fold change| ≥ 2 (which is |log2FC| ≥ 1)
+results <- topTable(fit2, number=Inf, adjust.method="BH")
+
+# Filter DEGs based on paper's thresholds
+DEGs <- results[results$adj.P.Val <= 0.05 & abs(results$logFC) >= 1.5, ]
+```
+
+### Convert Probe ID to Genes
+```{r}
+# Add gene annotation to results for interpretation
+DEGs$probe_id <- rownames(DEGs)
+DEGs$gene_id <- probe_annotations[rownames(DEGs), "ORF"]
+
+# Set up connection to Ensembl
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Get a list of all your gene identifiers
+gene_list <- DEGs$gene_id
+
+# Query to get gene biotypes
+gene_info <- getBM(
+  attributes = c("external_gene_name", "ensembl_gene_id", "entrezgene_id", "gene_biotype"),
+  filters = "external_gene_name",
+  values = gene_list,
+  mart = ensembl
+)
+
+# Filter to keep only protein-coding genes
+coding_genes <- gene_info[gene_info$gene_biotype == "protein_coding", ]
+
+# Get the list of coding gene identifiers
+coding_gene_ids <- coding_genes$external_gene_name
+
+# Filter your DEGs to keep only coding genes
+DEGs_coding <- DEGs[DEGs$gene_id %in% coding_gene_ids, ]
+```
+
+## Combine COVID DEGs and Clean Dataset
+```{r}
+COVID_DEGs <- rbind(DEGs_coding, DEGs_coding_severe)
+  
+# Remove duplicate rows based on probe_id
+COVID_DEGs <- COVID_DEGs %>%
+  group_by(gene_id) %>%
+  slice_min(adj.P.Val, with_ties = FALSE) %>%
+  ungroup()
+
+COVID_DEGs <- COVID_DEGs[c('adj.P.Val', "logFC", "gene_id")]
+
+COVID_DEGs$neg_log10_pval <- -log10(COVID_DEGs$adj.P.Val)
+```
+
+## Volcano Plot
+```{r}
+##severe results ------------------------------------------------------
+severe_results <- results_severe
+severe_results$probe_id <- rownames(results_severe)
+severe_results$gene_id <- probe_annotations[rownames(results_severe), "ORF"]
+severe_results$neg_log10_pval <- -log10(severe_results$adj.P.Val)
+severe_results <- severe_results %>%
+  filter(gene_id != "")
+
+# Remove duplicate rows based on probe_id
+severe_results <- severe_results %>%
+  group_by(gene_id) %>%
+  slice_min(adj.P.Val, with_ties = FALSE) %>%
+  ungroup()
+
+severe_results <- severe_results[c('adj.P.Val', "logFC", "gene_id")]
+severe_results$neg_log10_pval <- -log10(severe_results$adj.P.Val)
+
+severe_results$diffexpressed <- "NS"  # Not significant
+severe_results$diffexpressed[severe_results$logFC > 1.5 & severe_results$adj.P.Val < 0.05] <- "UP"
+severe_results$diffexpressed[severe_results$logFC < -1.5 & severe_results$adj.P.Val < 0.05] <- "DOWN"
+
+create_volcano_plot(severe_results, "Severe COVID vs Healthy Patients")
+
+##mild results ------------------------------------------------------
+mild_results <- results
+mild_results$probe_id <- rownames(results)
+mild_results$gene_id <- probe_annotations[rownames(results), "ORF"]
+mild_results$neg_log10_pval <- -log10(mild_results$adj.P.Val)
+mild_results <- mild_results %>%
+  filter(gene_id != "")
+
+# Remove duplicate rows based on probe_id
+mild_results <- mild_results %>%
+  group_by(gene_id) %>%
+  slice_min(adj.P.Val, with_ties = FALSE) %>%
+  ungroup()
+
+mild_results <- mild_results[c('adj.P.Val', "logFC", "gene_id")]
+mild_results$neg_log10_pval <- -log10(mild_results$adj.P.Val)
+
+mild_results$diffexpressed <- "NS"  # Not significant
+mild_results$diffexpressed[mild_results$logFC > 1.5 & mild_results$adj.P.Val < 0.05] <- "UP"
+mild_results$diffexpressed[mild_results$logFC < -1.5 & mild_results$adj.P.Val < 0.05] <- "DOWN"
+
+create_volcano_plot(mild_results, "Mild COVID vs Healthy Patients")
+```
+##Clean Up Environment
+```{r}
+keep <- c("COVID_DEGs", "create_volcano_plot", "normalize_expression_data", "process_multiple_probes")
+rm(list=setdiff(ls(), keep))
+```
+
+# Prebenson <- COVID19
+## Download and Process
+```{r}
+# Download GSE213313 dataset (H1N1)
+gse213313 <- getGEO("GSE213313", GSEMatrix = TRUE)
+expr_213313 <- exprs(gse213313[[1]])
+expr_213313 <- normalize_expression_data(expr_213313)
+
+#view the normalized data
+#boxplot(expr_213313,outline=FALSE)
+```
+
+## Get Probe Annotations for Later
+```{r}
+# Get probe annotations to have them available for interpretation later
+gpl <- getGEO("GPL21185")
+platform_info <- Table(gpl)
+probe_annotations <- platform_info[, c("ID", "GENE_SYMBOL", "ENSEMBL_ID")]
+probe_annotations[probe_annotations == ""] <- NA
+probe_annotations <- probe_annotations[!(is.na(probe_annotations$GENE_SYMBOL) & is.na(probe_annotations$ENSEMBL_ID)), ]
+
+# Identify rows with missing gene symbols but valid ENST IDs
+missing_gene_symbol <- is.na(probe_annotations$GENE_SYMBOL) & !is.na(probe_annotations$ENSEMBL_ID)
+
+if (any(missing_gene_symbol)) {
+  # Use transcript IDs (ENST) to get gene information
+  mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+  transcript_to_gene <- getBM(
+    attributes = c("ensembl_transcript_id", "external_gene_name"),  # or "hgnc_symbol"
+    filters = "ensembl_transcript_id",
+    values = probe_annotations$ENSEMBL_ID[missing_gene_symbol],
+    mart = mart
+  )
+  
+  # Create lookup table
+  transcript_lookup <- setNames(transcript_to_gene$external_gene_name, 
+                               transcript_to_gene$ensembl_transcript_id)
+  
+  # Map to gene symbols
+  probe_annotations$GENE_SYMBOL[missing_gene_symbol] <- 
+    transcript_lookup[probe_annotations$ENSEMBL_ID[missing_gene_symbol]]
+  
+  # Report results
+  mapped_count <- sum(!is.na(probe_annotations$GENE_SYMBOL[missing_gene_symbol]))
+  #cat("Successfully mapped", mapped_count, "of", sum(missing_gene_symbol), "ENST IDs\n")
+}
+
+# Set row names
+rownames(probe_annotations) <- probe_annotations$ID
+```
+
+## Extract Group Information
+```{r}
+# Extract sample information
+pdata_213313 <- pData(gse213313[[1]])
+
+# Create sample groups for Severe COVID vs Mild COVID vs Control comparison
+sample_groups_213313 <- ifelse(grepl("Healthy", pdata_213313$characteristics_ch1.1, ignore.case = TRUE), "Control", "COVID19")
+```
+
+## COVID19 vs Control
+```{r}
+# Set up design matrix for limma
+groups_factor <- factor(sample_groups_213313)
+design <- model.matrix(~0+groups_factor)
+colnames(design) <- levels(groups_factor)
+
+# Create contrast matrix
+contrast.matrix <- makeContrasts(COVID19-Control, levels=design)
+
+# Fit the linear model
+fit <- lmFit(expr_213313, design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# Get differentially expressed probes using the paper's criteria:
+# FDR ≤ 0.05 and |fold change| ≥ 2 (which is |log2FC| ≥ 1)
+results <- topTable(fit2, number=Inf, adjust.method="BH")
+
+# Filter DEGs based on paper's thresholds
+DEGs <- results[results$adj.P.Val <= 0.05 & abs(results$logFC) >= 1.5, ]
+
+DEGs[DEGs == ""] <- NA
+
+DEGs <- DEGs[complete.cases(DEGs),]
+```
+
+### Convert Probe ID to Genes
+```{r}
+# Add gene annotation to results for interpretation
+DEGs$probe_id <- rownames(DEGs)
+DEGs$gene_id <- probe_annotations[rownames(DEGs), "GENE_SYMBOL"]
+DEGs <- DEGs[c('adj.P.Val', "logFC", "gene_id")]
+DEGs$neg_log10_pval <- -log10(DEGs$adj.P.Val)
+
+DEGs <- DEGs %>%
+  filter(gene_id != "")
+```
+
+## Volcano Plot
+```{r}
+results$probe_id <- rownames(results)
+results$gene_id <- probe_annotations[rownames(results), "GENE_SYMBOL"]
+results$neg_log10_pval <- -log10(results$adj.P.Val)
+results <- results %>%
+  filter(gene_id != "")
+
+# Remove duplicate rows based on probe_id
+results <- results %>%
+  group_by(gene_id) %>%
+  slice_min(adj.P.Val, with_ties = FALSE) %>%
+  ungroup()
+
+results <- results[c('adj.P.Val', "logFC", "gene_id")]
+results$neg_log10_pval <- -log10(results$adj.P.Val)
+
+results$diffexpressed <- "NS"  # Not significant
+results$diffexpressed[results$logFC > 1.5 & results$adj.P.Val < 0.05] <- "UP"
+results$diffexpressed[results$logFC < -1.5 & results$adj.P.Val < 0.05] <- "DOWN"
+
+create_volcano_plot(results, "COVID19 vs Healthy Patients")
+```
+
+## Combine COVID DEGs
+```{r}
+COVID_DEGs <- rbind(COVID_DEGs, DEGs)
+  
+# Remove duplicate rows based on probe_id
+COVID_DEGs <- COVID_DEGs %>%
+  group_by(gene_id) %>%
+  slice_min(adj.P.Val, with_ties = FALSE) %>%
+  ungroup()
+```
+
+##Clean Up Environment
+```{r}
+keep <- c("COVID_DEGs", "create_volcano_plot", "normalize_expression_data", "process_multiple_probes")
+rm(list=setdiff(ls(), keep))
+```
+
+
+# H1N1 Influenza
+## Download and Process
+```{r h1n1-data}
+# Download GSE37571 dataset (H1N1)
+gse37571 <- getGEO("GSE37571", GSEMatrix = TRUE)
+expr_37571 <- exprs(gse37571[[1]])
+expr_37571 <- normalize_expression_data(expr_37571)
+
+#view the normalized data
+#boxplot(expr_37571,outline=FALSE)
+```
+
+## Get Probe Annotations for Later
+```{r}
+# Get probe annotations to have them available for interpretation later
+gpl <- getGEO("GPL6480")
+platform_info <- Table(gpl)
+probe_annotations <- platform_info[, c("ID", "GENE_SYMBOL")]
+probe_annotations <- probe_annotations[complete.cases(probe_annotations), ]
+rownames(probe_annotations) <- probe_annotations$ID
+```
+
+## Extract Group Information
+```{r}
+# Extract sample information
+pdata_37571 <- pData(gse37571[[1]])
+
+# Create sample groups for Severe COVID vs Mild COVID vs Control comparison
+sample_groups_37571 <- ifelse(grepl("mock", pdata_37571$title, ignore.case = TRUE), "Control", "H1N1")
+```
+
+## H1N1 vs Control
+```{r}
+# Set up design matrix for limma
+groups_factor <- factor(sample_groups_37571)
+design <- model.matrix(~0+groups_factor)
+colnames(design) <- levels(groups_factor)
+
+# Create contrast matrix
+contrast.matrix <- makeContrasts(H1N1-Control, levels=design)
+
+# Fit the linear model
+fit <- lmFit(expr_37571, design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# Get differentially expressed probes using the paper's criteria:
+# FDR ≤ 0.05 and |fold change| ≥ 2 (which is |log2FC| ≥ 1)
+results_H1N1 <- topTable(fit2, number=Inf, adjust.method="BH")
+
+# Filter DEGs based on paper's thresholds
+DEGs_H1N1 <- results_H1N1[results_H1N1$adj.P.Val <= 0.05 & abs(results_H1N1$logFC) >= 1.5, ]
+```
+
+### Convert Probe ID to Genes
+```{r}
+# Add gene annotation to results for interpretation
+DEGs_H1N1$probe_id <- rownames(DEGs_H1N1)
+DEGs_H1N1$gene_id <- probe_annotations[rownames(DEGs_H1N1), "GENE_SYMBOL"]
+```
+
+## Volcano Plot
+```{r}
+results_H1N1$probe_id <- rownames(results_H1N1)
+results_H1N1$gene_id <- probe_annotations[rownames(results_H1N1), "GENE_SYMBOL"]
+results_H1N1$neg_log10_pval <- -log10(results_H1N1$adj.P.Val)
+results_H1N1 <- results_H1N1 %>%
+  filter(gene_id != "")
+
+# Remove duplicate rows based on probe_id
+results_H1N1 <- results_H1N1 %>%
+  group_by(gene_id) %>%
+  slice_min(adj.P.Val, with_ties = FALSE) %>%
+  ungroup()
+
+results_H1N1 <- results_H1N1[c('adj.P.Val', "logFC", "gene_id")]
+results_H1N1$neg_log10_pval <- -log10(results_H1N1$adj.P.Val)
+
+results_H1N1$diffexpressed <- "NS"  # Not significant
+results_H1N1$diffexpressed[results_H1N1$logFC > 1.5 & results_H1N1$adj.P.Val < 0.05] <- "UP"
+results_H1N1$diffexpressed[results_H1N1$logFC < -1.5 & results_H1N1$adj.P.Val < 0.05] <- "DOWN"
+
+create_volcano_plot(results_H1N1, "H1N1 vs Healthy Patients")
+```
+
+## Clean H1N1 DEGs
+```{r}
+H1N1_DEGs <- DEGs_H1N1
+H1N1_DEGs$probe_id <- rownames(H1N1_DEGs)
+H1N1_DEGs$gene_id <- probe_annotations[rownames(H1N1_DEGs), "GENE_SYMBOL"]
+H1N1_DEGs$neg_log10_pval <- -log10(H1N1_DEGs$adj.P.Val)
+H1N1_DEGs <- H1N1_DEGs %>%
+  filter(gene_id != "")
+
+# Remove duplicate rows based on probe_id
+H1N1_DEGs <- H1N1_DEGs %>%
+  group_by(gene_id) %>%
+  slice_min(adj.P.Val, with_ties = FALSE) %>%
+  ungroup()
+
+H1N1_DEGs <- H1N1_DEGs[c('adj.P.Val', "logFC", "gene_id")]
+H1N1_DEGs$neg_log10_pval <- -log10(H1N1_DEGs$adj.P.Val)
+```
+
+##Clean Up Environment
+```{r}
+keep <- c("H1N1_DEGs", "COVID_DEGs", "create_volcano_plot", "normalize_expression_data", "process_multiple_probes")
+rm(list=setdiff(ls(), keep))
+```
+
+#Sepsis
+## Download and Process
+```{r sepsis-data}
+# Download GSE13904 dataset (Sepsis)
+gse13904 <- getGEO("GSE13904", GSEMatrix = TRUE)
+expr_13904 <- exprs(gse13904[[1]])
+expr_13904 <- normalize_expression_data(expr_13904)
+```
+
+## Get Probe Annotations for Later
+```{r}
+#gse13904[[1]]@annotation
+
+# Get probe annotations to have them available for interpretation later
+gpl <- getGEO("GPL570")
+platform_info <- Table(gpl)
+probe_annotations <- platform_info[, c("ID", "Gene Symbol")]
+probe_annotations <- probe_annotations[complete.cases(probe_annotations), ]
+rownames(probe_annotations) <- probe_annotations$ID
+```
+
+## Filter Group Information
+```{r}
+# Create groups vector
+pdata_13904 <- pData(gse13904[[1]])
+
+sample_groups_13904 <- ifelse(grepl("sepsis|septic", pdata_13904$title, ignore.case = TRUE), "Sepsis", 
+                              ifelse(grepl("SIRS", pdata_13904$title, ignore.case = TRUE), "SIRS", "Control"))
+
+# Filter to include only Severe COVID and Control samples
+groups_sepsis <- ifelse(sample_groups_13904 %in% c("Sepsis", "Control"), 
+                ifelse(sample_groups_13904 == "Sepsis", "Sepsis", "Control"), NA)
+
+# Filter expression data to only include Severe COVID and Control samples
+expr_13904_sepsis <- expr_13904[, !is.na(groups_sepsis)]
+
+# Create filtered groups_severe vector
+groups_sepsis <- groups_sepsis[!is.na(groups_sepsis)]
+```
+
+## Sepsis vs Control
+```{r}
+# Set up design matrix for limma
+groups_sepsis_factor <- factor(groups_sepsis)
+design <- model.matrix(~0+groups_sepsis_factor)
+colnames(design) <- levels(groups_sepsis_factor)
+
+# Create contrast matrix
+contrast.matrix <- makeContrasts(Sepsis-Control, levels=design)
+
+# Fit the linear model
+fit <- lmFit(expr_13904_sepsis, design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# Get differentially expressed probes using the paper's criteria:
+# FDR ≤ 0.05 and |fold change| ≥ 2 (which is |log2FC| ≥ 1)
+results_sepsis <- topTable(fit2, number=Inf, adjust.method="BH")
+
+# Filter DEGs based on paper's thresholds
+Sepsis_DEGs <- results_sepsis[results_sepsis$adj.P.Val <= 0.05 & abs(results_sepsis$logFC) >= 1.5, ]
+```
+
+### Convert Probe ID to Genes
+```{r}
+# Get platform annotation
+platform_13904 <- gse13904[[1]]@annotation
+
+probe_ids <- rownames(Sepsis_DEGs)
+# HG-U133_Plus_2
+gene_symbols <- mapIds(hgu133plus2.db, keys = probe_ids, column = "SYMBOL", keytype = "PROBEID", multiVals = "first")
+
+# Create a data frame with both probe IDs and gene symbols
+Sepsis_DEGs <- data.frame(
+    probe_id = probe_ids,
+    gene_symbol = gene_symbols,
+    Sepsis_DEGs
+)
+```
+
+## Volcano Plot
+```{r}
+results_sepsis$probe_id <- rownames(results_sepsis)
+results_sepsis$gene_id <- probe_annotations[rownames(results_sepsis), "Gene Symbol"]
+results_sepsis$neg_log10_pval <- -log10(results_sepsis$adj.P.Val)
+results_sepsis <- results_sepsis %>%
+  filter(gene_id != "")
+
+# Remove duplicate rows based on probe_id
+results_sepsis <- results_sepsis %>%
+  group_by(gene_id) %>%
+  slice_min(adj.P.Val, with_ties = FALSE) %>%
+  ungroup()
+
+results_sepsis <- results_sepsis[c('adj.P.Val', "logFC", "gene_id")]
+results_sepsis$neg_log10_pval <- -log10(results_sepsis$adj.P.Val)
+
+results_sepsis$diffexpressed <- "NS"  # Not significant
+results_sepsis$diffexpressed[results_sepsis$logFC > 1.5 & results_sepsis$adj.P.Val < 0.05] <- "UP"
+results_sepsis$diffexpressed[results_sepsis$logFC < -1.5 & results_sepsis$adj.P.Val < 0.05] <- "DOWN"
+
+create_volcano_plot(results_sepsis, "Sepsis vs Healthy Patients")
+```
+
+## Clean Sepsis DEGs
+```{r}
+Sepsis_DEGs$probe_id <- rownames(Sepsis_DEGs)
+Sepsis_DEGs$gene_id <- probe_annotations[rownames(Sepsis_DEGs), "GENE_SYMBOL"]
+Sepsis_DEGs$neg_log10_pval <- -log10(Sepsis_DEGs$adj.P.Val)
+Sepsis_DEGs <- Sepsis_DEGs %>%
+  filter(gene_symbol != "")
+
+# Remove duplicate rows based on probe_id
+Sepsis_DEGs <- Sepsis_DEGs %>%
+  group_by(gene_symbol) %>%
+  slice_min(adj.P.Val, with_ties = FALSE) %>%
+  ungroup()
+
+Sepsis_DEGs <- Sepsis_DEGs[c('adj.P.Val', "logFC", "gene_symbol")]
+Sepsis_DEGs$neg_log10_pval <- -log10(Sepsis_DEGs$adj.P.Val)
+
+colnames(Sepsis_DEGs) <- c('adj.P.Val', "logFC", "gene_id", "neg_log10_pval")
+```
+
+##Clean Up Environment
+```{r}
+keep <- c("Sepsis_DEGs" ,"H1N1_DEGs", "COVID_DEGs", "create_volcano_plot", "normalize_expression_data", "process_multiple_probes")
+rm(list=setdiff(ls(), keep))
+```
+
+#Save DEGs as TXT
+```{r}
+cat(COVID_genes, file = "COVID_DEGs.txt", sep = "\n")
+cat(H1N1_genes, file = "H1N1_DEGs.txt", sep = "\n")
+cat(Sepsis_genes, file = "Sepsis_DEGs.txt", sep = "\n")
+```
+
+
+# Compare DEGs
+```{r}
+#Create gene lists for comparison
+COVID_genes <- COVID_DEGs$gene_id
+H1N1_genes <- H1N1_DEGs$gene_id
+Sepsis_genes <- Sepsis_DEGs$gene_id
+```
+
+## UpSet Plot
+```{r}
+# 5. Create an UpSet plot as an alternative to Venn diagram
+upset_input <- list(
+  COVID = COVID_genes,
+  H1N1 = H1N1_genes, 
+  Sepsis = Sepsis_genes
+)
+
+upset_data <- fromList(upset_input)
+upset_plot <- upset(upset_data, order.by = "freq", nsets = 3)
+print(upset_plot)
+```
+
+## Venn Diagram
+```{r}
+# Create the input list
+venn_list <- list(
+  "COVID-19" = COVID_genes,
+  "H1N1" = H1N1_genes,
+  "Sepsis" = Sepsis_genes
+)
+
+# Specify the filepath where you want to save the Venn diagram
+output_file <- "venn_diagram_comparison.png"
+
+# Create the Venn diagram and save it to the specified file
+venn.diagram(
+  x = venn_list,
+  category.names = c("COVID-19", "H1N1", "Sepsis"),
+  filename = output_file,
+  output = TRUE,
+  imagetype = "png",
+  height = 3000,
+  width = 3000,
+  resolution = 300,
+  compression = "lzw",
+  lwd = 2,
+  col = c("#440154FF", "#21908CFF", "#FDE725FF"),
+  fill = c(alpha("#440154FF", 0.5), alpha("#21908CFF", 0.5), alpha("#FDE725FF", 0.5)),
+  cex = 1.5,
+  fontfamily = "sans",
+  cat.cex = 1.5,
+  cat.default.pos = "outer",
+  cat.pos = c(-30, 30, 0),
+  cat.dist = c(0.03, 0.03, 0.03)
+)
+```
+
+![](venn_diagram_comparison.png)
+
+## Common Genes
+```{r}
+# 6. Create a function to examine gene direction in overlapping genes
+compare_gene_direction <- function(gene_list, covid_df, h1n1_df, sepsis_df) {
+  result <- data.frame(gene_id = gene_list)
+  
+  result$COVID_logFC <- covid_df$logFC[match(gene_list, covid_df$gene_id)]
+  result$COVID_direction <- ifelse(result$COVID_logFC > 0, "Up", "Down")
+  
+  result$H1N1_logFC <- h1n1_df$logFC[match(gene_list, h1n1_df$gene_id)]
+  result$H1N1_direction <- ifelse(result$H1N1_logFC > 0, "Up", "Down")
+  
+  result$Sepsis_logFC <- sepsis_df$logFC[match(gene_list, sepsis_df$gene_id)]
+  result$Sepsis_direction <- ifelse(result$Sepsis_logFC > 0, "Up", "Down")
+  
+  return(result)
+}
+
+all_overlaps <- list(
+  common_all = Reduce(intersect, list(COVID_genes, H1N1_genes, Sepsis_genes)),
+  COVID_H1N1 = setdiff(intersect(COVID_genes, H1N1_genes), Sepsis_genes),
+  COVID_Sepsis = setdiff(intersect(COVID_genes, Sepsis_genes), H1N1_genes),
+  H1N1_Sepsis = setdiff(intersect(H1N1_genes, Sepsis_genes), COVID_genes),
+  COVID_only = setdiff(COVID_genes, union(H1N1_genes, Sepsis_genes)),
+  H1N1_only = setdiff(H1N1_genes, union(COVID_genes, Sepsis_genes)),
+  Sepsis_only = setdiff(Sepsis_genes, union(COVID_genes, H1N1_genes))
+)
+
+# Analyze genes found in all three conditions
+common_genes_analysis <- compare_gene_direction(all_overlaps$common_all, COVID_DEGs, H1N1_DEGs, Sepsis_DEGs)
+print(common_genes_analysis)
+
+# Extract logFC values from the common genes dataframe
+heatmap_matrix <- as.matrix(common_genes_analysis[, c("COVID_logFC", "H1N1_logFC", "Sepsis_logFC")])
+
+# Assign gene names as row names
+rownames(heatmap_matrix) <- common_genes_analysis$gene_id
+colnames(heatmap_matrix) <- c("COVID19", "H1N1", "Sepsis")
+
+# Open a PNG device
+#png("heatmap_logFC.png", width = 800, height = 600, res = 150)
+# Generate heatmap
+#ComplexHeatmap::pheatmap(heatmap_matrix, 
+#                         legend = TRUE, 
+#                         cluster_rows = FALSE, 
+#                         cluster_cols = FALSE, 
+#                         heatmap_legend_param = list(title = "LogFC", at = c(4, 2, 0, -2, -4)),
+#                         main = "LogFC of Common Genes Across Conditions")
+# Close the device to save the file
+#dev.off()
+
+# Generate heatmap
+ComplexHeatmap::pheatmap(heatmap_matrix, 
+                         legend = TRUE, 
+                         cluster_rows = FALSE, 
+                         cluster_cols = FALSE, 
+                         heatmap_legend_param = list(title = "LogFC", at = c(4, 2, 0, -2, -4)),
+                         main = "LogFC of Common Genes Across Conditions")
+```
+
+## Focus on cytokine storm-related genes
+```{r}
+cytokine_storm_genes <- readLines("cytokine_storm.txt")
+
+# Check which cytokine storm genes are in our DEG lists
+cytokine_in_covid <- cytokine_storm_genes[cytokine_storm_genes %in% COVID_genes]
+cytokine_in_h1n1 <- cytokine_storm_genes[cytokine_storm_genes %in% H1N1_genes]
+cytokine_in_sepsis <- cytokine_storm_genes[cytokine_storm_genes %in% Sepsis_genes]
+
+cat("Cytokine storm genes in COVID-19:", paste(cytokine_in_covid, collapse=", "), "\n")
+cat("Cytokine storm genes in H1N1:", paste(cytokine_in_h1n1, collapse=", "), "\n")
+cat("Cytokine storm genes in Sepsis:", paste(cytokine_in_sepsis, collapse=", "), "\n")
+
+```
+
+```{r}
+# Create a list for UpSetR
+upset_list <- list(
+  COVID = cytokine_in_covid,
+  H1N1 = cytokine_in_h1n1,
+  Sepsis = cytokine_in_sepsis
+)
+
+# Create the UpSet plot
+upset(fromList(upset_list), 
+      #order.by = "freq", 
+      nsets = 3,
+      sets = c("COVID", "H1N1", "Sepsis"),
+      main.bar.color = "black",
+      matrix.color = "black",
+      text.scale = 1.5,
+      point.size = 3.5,
+      line.size = 1,
+      mainbar.y.label = "Gene Intersection",
+      sets.x.label = "Genes Per Condition")
+
+# Open a PNG device
+png("cytokine_upset.png", width = 800, height = 800, res = 150)
+# Create the UpSet plot
+upset(fromList(upset_list), 
+      #order.by = "freq", 
+      nsets = 3,
+      sets = c("COVID", "H1N1", "Sepsis"),
+      main.bar.color = "black",
+      matrix.color = "black",
+      text.scale = 1.5,
+      point.size = 3.5,
+      line.size = 1,
+      mainbar.y.label = "Gene Intersection",
+      sets.x.label = "# of Genes")
+dev.off()
+```
+
+
+## Create a heatmap of cytokine storm genes across conditions
+```{r, warning=FALSE}
+# Create a function to extract logFC values for a list of genes
+get_logFC_values <- function(gene_list, covid_df, h1n1_df, sepsis_df) {
+  # Initialize matrix
+  result_matrix <- matrix(NA, nrow = length(gene_list), ncol = 3)
+  rownames(result_matrix) <- gene_list
+  colnames(result_matrix) <- c("COVID-19", "H1N1", "Sepsis")
+  
+  # Fill with logFC values where available
+  for (i in 1:length(gene_list)) {
+    gene <- gene_list[i]
+    covid_idx <- which(covid_df$gene_id == gene)
+    h1n1_idx <- which(h1n1_df$gene_id == gene)
+    sepsis_idx <- which(sepsis_df$gene_id == gene)
+    
+    if (length(covid_idx) > 0) result_matrix[i, 1] <- covid_df$logFC[covid_idx[1]]
+    if (length(h1n1_idx) > 0) result_matrix[i, 2] <- h1n1_df$logFC[h1n1_idx[1]]
+    if (length(sepsis_idx) > 0) result_matrix[i, 3] <- sepsis_df$logFC[sepsis_idx[1]]
+  }
+  
+  return(result_matrix)
+}
+
+# Get logFC values for all cytokine storm genes
+cs_logFC_matrix <- as_tibble(get_logFC_values(cytokine_storm_genes, COVID_DEGs, H1N1_DEGs, Sepsis_DEGs))
+row.names(cs_logFC_matrix) <- cytokine_storm_genes
+cs_logFC_matrix <- cs_logFC_matrix %>%
+  filter(if_any(everything(), ~!is.na(.)))
+cs_logFC_matrix <- as.matrix(cs_logFC_matrix)
+
+# Create heatmap
+pheatmap(cs_logFC_matrix,
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         fontsize_row = 10,
+         fontsize_col = 10,
+         main = "LogFC of Cytokine Storm Genes Across Conditions",
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         na_col = "grey")
+
+# Open a PNG device
+png("cytokine_heatmap_logFC.png", width = 800, height = 600, res = 150)
+# Generate heatmap
+ComplexHeatmap::pheatmap(cs_logFC_matrix,
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         fontsize_row = 10,
+         fontsize_col = 10,
+         main = "Cytokine Storm Genes Across Conditions",
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         na_col = "grey",
+         heatmap_legend_param = list(title = "LogFC", at = c(5, 0, -5, -10, -15)))
+# Close the device to save the file
+dev.off()
+```
+
+## Functional enrichment analysis
+### All Terms
+```{r}
+# Convert gene IDs to entrez IDs if needed (assuming gene_id is HGNC symbol)
+convert_to_entrez <- function(gene_list) {
+  entrez_ids <- mapIds(org.Hs.eg.db, keys = gene_list, keytype = "SYMBOL", column = "ENTREZID")
+  return(entrez_ids[!is.na(entrez_ids)])
+}
+
+# Perform enrichment analysis
+run_GO_enrichment <- function(gene_list, ont = "BP") {
+  entrez_ids <- convert_to_entrez(gene_list)
+  if (length(entrez_ids) < 5) {
+    return(NULL)  # Not enough genes for meaningful enrichment
+  }
+  
+  ego <- enrichGO(gene = entrez_ids,
+                  OrgDb = org.Hs.eg.db,
+                  ont = ont,
+                  pAdjustMethod = "BH",
+                  pvalueCutoff = 0.05,
+                  qvalueCutoff = 0.1)
+  
+  return(ego)
+}
+
+# Run GO enrichment for each condition
+covid_bp <- run_GO_enrichment(COVID_genes)
+h1n1_bp <- run_GO_enrichment(H1N1_genes)
+sepsis_bp <- run_GO_enrichment(Sepsis_genes)
+
+# Function to create individual dotplots with compact legends on the right side
+create_dotplot <- function(ego_result, title) {
+  if (is.null(ego_result) || nrow(ego_result@result) == 0) {
+    message(paste("No significant enrichment for", title))
+    return(NULL)
+  }
+  
+  # Sort by adjusted p-value and take top terms
+  result_df <- ego_result@result
+  result_df <- result_df[order(result_df$p.adjust), ]
+  result_df <- head(result_df, 20)  # Adjust number of terms as needed
+  
+  # Create dotplot with compact legends on the right
+  p <- dotplot(ego_result, 
+               showCategory = 20,  # Adjust as needed
+               title = title) +
+    theme_minimal() +
+    labs(x = "GeneRatio", y = NULL) +
+    scale_color_gradient(name = "p.adjust", 
+                        low = "chartreuse3", 
+                        high = "royalblue") +
+    theme(axis.text.y = element_text( hjust = 1, size = 10),
+          axis.text.x = element_text(size = 10),
+          plot.title = element_text(size = 12, face = "bold"),
+          legend.position = "right",  # Changed to right
+          legend.key.size = unit(0.8, "lines"),
+          legend.margin = margin(t = 0, r = 0, b = 0, l = 0, unit = "pt"),
+          legend.spacing.y = unit(0.2, "cm"),  # Space between legends when vertical
+          legend.text = element_text(size = 8),
+          legend.title = element_text(size = 8)
+          ) +
+    scale_size_continuous(name = "Count", range = c(3, 6)) +
+    # Customize guides for vertical layout
+    guides(
+      color = guide_colorbar(
+        barwidth = unit(0.5, "cm"),
+        barheight = unit(4, "cm"),
+        title.position = "top",
+        title.hjust = 0.5
+      ),
+      size = guide_legend(
+        ncol = 1,  # Force into single column for right-side positioning
+        byrow = TRUE,
+        title.position = "top",
+        title.hjust = 0.5
+      )
+    )
+  
+  return(p)
+}
+
+# Create separate plots for each condition
+
+covid_plot <- create_dotplot(covid_bp, "COVID-19 Associated GO Terms")
+ggsave("GO_Plots/COVID_GO_terms.png", covid_plot, width = 5, height = 8)
+
+h1n1_plot <- create_dotplot(h1n1_bp, "H1N1 Associated GO Terms")
+ggsave("GO_Plots/H1N1_GO_terms.png", h1n1_plot, width = 5, height = 8)
+
+sepsis_plot <- create_dotplot(sepsis_bp, "Sepsis Associated GO Terms")
+ggsave("GO_Plots/Sepsis_GO_terms.png", sepsis_plot, width = 5, height = 8)
+
+png("GO_Plots/combined_go_plots.png", width = 2400, height = 1500, res = 150)
+grid.arrange(covid_plot, h1n1_plot, sepsis_plot, ncol = 3)
+dev.off()
+
+grid.arrange(covid_plot, h1n1_plot, sepsis_plot, ncol = 3)
+```
+
+### Immune Terms
+```{r}
+filter_immune_terms <- function(ego_result, title) {
+  if (is.null(ego_result) || nrow(ego_result@result) == 0) {
+    return(NULL)
+  }
+  
+  # Filter for immune-related terms - FIXED LINE HERE
+  immune_terms <- grep("immun|cytokine|inflamm|interleukin|interferon|chemokine|neutrophil|leukocyte", 
+                      ego_result@result$Description, value = FALSE)
+  
+  if (length(immune_terms) == 0) {
+    message(paste("No immune-related terms found for", title))
+    return(NULL)
+  }
+  
+  # Create a filtered object
+  filtered_result <- ego_result
+  filtered_result@result <- ego_result@result[immune_terms, ]
+  
+  # Create plot
+  p <- dotplot(filtered_result, # SHOULD USE filtered_result HERE, not ego_result
+               showCategory = 20,  # Adjust as needed
+               title = title) +
+    theme_minimal() +
+    labs(x = "GeneRatio", y = NULL) +
+    scale_color_gradient(name = "p.adjust", 
+                        low = "chartreuse3", 
+                        high = "royalblue") +
+    theme(axis.text.y = element_text( hjust = 1, size = 10),
+          axis.text.x = element_text(size = 10),
+          plot.title = element_text(size = 12, face = "bold"),
+          legend.position = "right",  # Changed to right
+          legend.key.size = unit(0.8, "lines"),
+          legend.margin = margin(t = 0, r = 0, b = 0, l = 0, unit = "pt"),
+          legend.spacing.y = unit(0.2, "cm"),  # Space between legends when vertical
+          legend.text = element_text(size = 8),
+          legend.title = element_text(size = 8)
+          ) +
+    scale_size_continuous(name = "Count", range = c(3, 6)) +
+    # Customize guides for vertical layout
+    guides(
+      color = guide_colorbar(
+        barwidth = unit(0.5, "cm"),
+        barheight = unit(4, "cm"),
+        title.position = "top",
+        title.hjust = 0.5
+      ),
+      size = guide_legend(
+        ncol = 1,  # Force into single column for right-side positioning
+        byrow = TRUE,
+        title.position = "top",
+        title.hjust = 0.5
+      )
+    )
+  
+  return(p)
+}
+
+# Generate immune-focused plots if desired
+covid_immune_plot <- filter_immune_terms(covid_bp, "COVID-19 Immune GO Terms")
+h1n1_immune_plot <- filter_immune_terms(h1n1_bp, "H1N1 Immune GO Terms")
+sepsis_immune_plot <- filter_immune_terms(sepsis_bp, "Sepsis Immune GO Terms")
+
+# Print immune plots
+print(covid_immune_plot)
+ggsave("GO_Plots/Immune/COVID_immune_GO_terms.png", covid_immune_plot, width = 5, height = 8)
+
+print(h1n1_immune_plot)
+ggsave("GO_Plots/Immune/H1N1_immune_GO_terms.png", h1n1_immune_plot, width = 5, height = 8)
+
+print(sepsis_immune_plot)
+ggsave("GO_Plots/Immune/Sepsis_immune_GO_terms.png", sepsis_immune_plot, width = 5, height = 8)
+
+png("GO_Plots/Immune/combined_go_plots.png", width = 2400, height = 1500, res = 150)
+grid.arrange(covid_immune_plot, h1n1_immune_plot, sepsis_immune_plot, ncol = 3)
+dev.off()
+
+grid.arrange(covid_immune_plot, h1n1_immune_plot, sepsis_immune_plot, ncol = 3)
+```
+
+### All Terms Heatmap
+```{r}
+# Extract top terms and convert NA p-values to 1 (least significant)
+get_top_terms <- function(ego_result, n=20) {
+  if(is.null(ego_result)) return(NULL)
+  result <- as.data.frame(ego_result@result)
+  result <- result[order(result$p.adjust), ]
+  head(result, n)
+}
+
+covid_top <- get_top_terms(covid_bp)
+h1n1_top <- get_top_terms(h1n1_bp)
+sepsis_top <- get_top_terms(sepsis_bp)
+
+# Combine all unique top GO terms
+all_top_terms <- unique(c(covid_top$Description, h1n1_top$Description, sepsis_top$Description))
+
+# Create data frame for heatmap
+heatmap_data <- data.frame(Term = all_top_terms)
+heatmap_data$COVID <- NA
+heatmap_data$H1N1 <- NA
+heatmap_data$Sepsis <- NA
+
+# Fill with -log10(p.adjust) values
+for(i in 1:nrow(heatmap_data)) {
+  term <- heatmap_data$Term[i]
+  
+  covid_match <- covid_top[covid_top$Description == term, ]
+  if(nrow(covid_match) > 0) heatmap_data$COVID[i] <- -log10(covid_match$p.adjust[1])
+  
+  h1n1_match <- h1n1_top[h1n1_top$Description == term, ]
+  if(nrow(h1n1_match) > 0) heatmap_data$H1N1[i] <- -log10(h1n1_match$p.adjust[1])
+  
+  sepsis_match <- sepsis_top[sepsis_top$Description == term, ]
+  if(nrow(sepsis_match) > 0) heatmap_data$Sepsis[i] <- -log10(sepsis_match$p.adjust[1])
+}
+
+# Convert to matrix for pheatmap
+rownames(heatmap_data) <- heatmap_data$Term
+heatmap_matrix <- as.matrix(heatmap_data[,c("COVID", "H1N1", "Sepsis")])
+
+# Create custom color function including gray for NA values
+custom_colors <- colorRampPalette(c("white", "red"))(50)
+custom_breaks <- seq(0, max(heatmap_matrix, na.rm=TRUE), length.out=50)
+
+png("GO_Plots/go_heatmap.png", width = 1600, height = 1000, res = 120)
+
+# Create heatmap with NA handling
+ComplexHeatmap::pheatmap(heatmap_matrix, 
+         color = custom_colors,
+         breaks = custom_breaks,
+         cluster_rows = FALSE, 
+         cluster_cols = FALSE,
+         na_col = "grey90",    # Grey color for NA values
+         fontsize_row = 8,
+         main = "GO Term Enrichment Across Diseases",
+         heatmap_legend_param = list(title = "-10Log(Adj.P.Val)", at = c(50, 40, 30, 20, 10, 0)))
+
+dev.off()
+```
+
+### Immune Terms Heatmap
+```{r}
+# Extract top immune-related terms only
+get_top_immune_terms <- function(ego_result, n=20) {
+  if(is.null(ego_result)) return(NULL)
+  
+  # Get all results
+  result <- as.data.frame(ego_result@result)
+  
+  # Filter for immune-related terms
+  immune_pattern <- "immun|cytokine|inflamm|interleukin|interferon|chemokine|neutrophil|leukocyte"
+  immune_indices <- grep(immune_pattern, result$Description, ignore.case = TRUE)
+  
+  # Return empty dataframe if no immune terms found
+  if(length(immune_indices) == 0) return(data.frame())
+  
+  # Get immune-related rows and sort by p.adjust
+  immune_result <- result[immune_indices, ]
+  immune_result <- immune_result[order(immune_result$p.adjust), ]
+  
+  # Return top n terms (or all if fewer than n)
+  return(head(immune_result, n))
+}
+
+# Get top immune terms for each disease
+covid_top <- get_top_immune_terms(covid_bp)
+h1n1_top <- get_top_immune_terms(h1n1_bp)
+sepsis_top <- get_top_immune_terms(sepsis_bp)
+
+# Check if we have immune terms for each disease
+covid_terms <- nrow(covid_top) > 0
+h1n1_terms <- nrow(h1n1_top) > 0
+sepsis_terms <- nrow(sepsis_top) > 0
+
+if(!covid_terms && !h1n1_terms && !sepsis_terms) {
+  message("No immune-related terms found in any disease")
+} else {
+  # Combine all unique top immune GO terms
+  all_top_terms <- unique(c(
+    if(covid_terms) covid_top$Description else character(0),
+    if(h1n1_terms) h1n1_top$Description else character(0),
+    if(sepsis_terms) sepsis_top$Description else character(0)
+  ))
+  
+  # Create data frame for heatmap
+  heatmap_data <- data.frame(Term = all_top_terms)
+  heatmap_data$COVID <- NA
+  heatmap_data$H1N1 <- NA
+  heatmap_data$Sepsis <- NA
+  
+  # Fill with -log10(p.adjust) values
+  for(i in 1:nrow(heatmap_data)) {
+    term <- heatmap_data$Term[i]
+    
+    if(covid_terms) {
+      covid_match <- covid_top[covid_top$Description == term, ]
+      if(nrow(covid_match) > 0) heatmap_data$COVID[i] <- -log10(covid_match$p.adjust[1])
+    }
+    
+    if(h1n1_terms) {
+      h1n1_match <- h1n1_top[h1n1_top$Description == term, ]
+      if(nrow(h1n1_match) > 0) heatmap_data$H1N1[i] <- -log10(h1n1_match$p.adjust[1])
+    }
+    
+    if(sepsis_terms) {
+      sepsis_match <- sepsis_top[sepsis_top$Description == term, ]
+      if(nrow(sepsis_match) > 0) heatmap_data$Sepsis[i] <- -log10(sepsis_match$p.adjust[1])
+    }
+  }
+  
+  # Convert to matrix for pheatmap
+  rownames(heatmap_data) <- heatmap_data$Term
+  heatmap_matrix <- as.matrix(heatmap_data[,c("COVID", "H1N1", "Sepsis")])
+  
+  # Create custom color function including gray for NA values
+  custom_colors <- colorRampPalette(c("white", "red"))(50)
+  custom_breaks <- seq(0, max(heatmap_matrix, na.rm=TRUE), length.out=50)
+  
+  png("GO_Plots/Immune/immune_go_heatmap.png", width = 1600, height = 1000, res = 120)
+  
+  # Create heatmap with NA handling
+  pheatmap(heatmap_matrix, 
+          color = custom_colors,
+          breaks = custom_breaks,
+          cluster_rows = FALSE, 
+          cluster_cols = FALSE,
+          na_col = "grey90",    # Grey color for NA values
+          fontsize_row = 8,
+          main = "Immune GO Term Enrichment Across Diseases",
+          heatmap_legend_param = list(title = "-10Log(Adj.P.Val)", at = c(20, 15, 10, 5, 0)))
+  
+  dev.off()
+}
+```
